@@ -1,0 +1,114 @@
+name: inject-alpine-iso
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  inject-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y squashfs-tools xorriso syslinux-utils genisoimage rsync curl
+
+      - name: Download ISO
+        run: |
+          ISO_URL="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-virt-3.23.3-x86_64.iso"
+          curl -L --fail -o alpine.iso "$ISO_URL"
+
+      - name: Prepare workspace
+        run: |
+          mkdir iso_mnt workdir editdir
+          sudo mount -o loop alpine.iso iso_mnt
+          rsync -a --exclude=TRANS.TBL iso_mnt/ workdir/
+          sudo umount iso_mnt
+
+      - name: Find squashfs and unpack
+        id: find_sfs
+        run: |
+          SFS_PATH=$(find workdir -type f -name '*.squashfs' | head -n1)
+          if [ -z "$SFS_PATH" ]; then
+            echo "no_squashfs=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          echo "sfs_path=$SFS_PATH" >> $GITHUB_OUTPUT
+          mkdir -p editroot
+          unsquashfs -f -d editroot "$SFS_PATH"
+          echo "unpacked=true" >> $GITHUB_OUTPUT
+
+      - name: Inject startup script (if squashfs found)
+        if: steps.find_sfs.outputs.unpacked == 'true'
+        run: |
+          set -e
+          mkdir -p editroot/etc/local.d
+          cat > editroot/etc/local.d/zz-remote.start <<'EOF'
+#!/bin/sh
+# Ensure network
+if command -v /etc/init.d/networking >/dev/null 2>&1; then
+  /etc/init.d/networking start || true
+fi
+# get MAC address of first non-loopback interface
+mac=$(ip -o link show | awk -F 'link/ether ' '{print $2; exit}' | awk '{print $1}')
+if [ -z "$mac" ]; then
+  mac=$(grep -m1 '' /sys/class/net/*/address 2>/dev/null || true)
+  mac=$(echo "$mac" | head -n1)
+fi
+# fetch & execute remote script with retry
+while true; do
+  if curl -fsS "http://192.168.5.2:3001/getScript?mac=${mac}" -o /tmp/remote_script.sh; then
+    chmod +x /tmp/remote_script.sh
+    /bin/sh /tmp/remote_script.sh && break || true
+  fi
+  sleep 10
+done
+EOF
+          chmod +x editroot/etc/local.d/zz-remote.start
+          # Repack squashfs
+          SFS_PATH="${{ steps.find_sfs.outputs.sfs_path }}"
+          SFS_DIR=$(dirname "$SFS_PATH")
+          TMP_SFS=$(mktemp -u)/new.squashfs
+          mksquashfs editroot "$TMP_SFS" -noappend -comp xz
+          mv "$TMP_SFS" "$SFS_PATH"
+          rm -rf editroot
+
+      - name: Rebuild ISO
+        run: |
+          cd workdir
+          # Attempt to preserve original boot layout (may need adjustments for different images)
+          xorriso -as mkisofs \
+            -o ../alpine-custom.iso \
+            -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
+            -c isolinux/boot.cat -b isolinux/isolinux.bin \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot \
+            .
+          cd ..
+
+      - name: Create GitHub release
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: alpine-custom-$(date +%Y%m%d%H%M%S)
+          release_name: alpine-custom
+          body: "Alpine ISO with injected startup script"
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload ISO to release
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./alpine-custom.iso
+          asset_name: alpine-custom.iso
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
