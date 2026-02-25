@@ -1,95 +1,146 @@
-name: inject-alpine-iso
+name: Build Custom Alpine ISO
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  inject-and-release:
+  build:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install tools
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y squashfs-tools xorriso syslinux-utils genisoimage rsync curl
+          sudo apt update
+          sudo apt install -y xorriso isolinux squashfs-tools cpio zstd
 
-      - name: Download ISO
-        run: |
-          ISO_URL="https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-virt-3.23.3-x86_64.iso"
-          curl -L --fail -o alpine.iso "$ISO_URL"
+      - name: Set Alpine version
+        run: echo "ALPINE_VERSION=3.23.3" >> $GITHUB_ENV
 
-      - name: Prepare workspace
+      - name: Download Alpine ISO
         run: |
-          mkdir iso_mnt workdir editdir
-          sudo mount -o loop alpine.iso iso_mnt
-          rsync -a --exclude=TRANS.TBL iso_mnt/ workdir/
-          sudo umount iso_mnt
+          wget "https://dl-cdn.alpinelinux.org/alpine/v3.23/releases/x86_64/alpine-virt-${{ env.ALPINE_VERSION }}-x86_64.iso" -O alpine.iso
 
-      - name: Find squashfs and unpack
-        id: find_sfs
+      - name: Extract ISO contents
         run: |
-          SFS_PATH=$(find workdir -type f -name '*.squashfs' | head -n1)
-          if [ -z "$SFS_PATH" ]; then
-            echo "no_squashfs=true" >> $GITHUB_OUTPUT
-            exit 0
+          mkdir iso
+          xorriso -osirrox on -indev alpine.iso -extract / iso/ && chmod -R +w iso/
+
+      - name: Locate initramfs
+        run: |
+          INITRAMFS_PATH=$(find iso -name "initramfs-*" | head -1)
+          echo "INITRAMFS_PATH=$INITRAMFS_PATH" >> $GITHUB_ENV
+
+      - name: Extract initramfs
+        run: |
+          mkdir initramfs
+          cd initramfs
+          if file "$INITRAMFS_PATH" | grep -q gzip; then
+            gunzip -c "$INITRAMFS_PATH" | cpio -id
+          elif file "$INITRAMFS_PATH" | grep -q Zstandard; then
+            zstd -d -c "$INITRAMFS_PATH" | cpio -id
+          else
+            cpio -id < "$INITRAMFS_PATH"
           fi
-          echo "sfs_path=$SFS_PATH" >> $GITHUB_OUTPUT
-          mkdir -p editroot
-          unsquashfs -f -d editroot "$SFS_PATH"
-          echo "unpacked=true" >> $GITHUB_OUTPUT
-
-      - name: Inject startup script (if squashfs found)
-        if: steps.find_sfs.outputs.unpacked == 'true'
-        run: |
-          set -e
-          mkdir -p editroot/etc/local.d
-          # Copy prepared startup script from repository into the image root
-          cp zz-remote.start editroot/etc/local.d/zz-remote.start
-          chmod +x editroot/etc/local.d/zz-remote.start
-          # Repack squashfs
-          SFS_PATH="${{ steps.find_sfs.outputs.sfs_path }}"
-          SFS_DIR=$(dirname "$SFS_PATH")
-          TMP_SFS=$(mktemp -u)/new.squashfs
-          mksquashfs editroot "$TMP_SFS" -noappend -comp xz
-          mv "$TMP_SFS" "$SFS_PATH"
-          rm -rf editroot
-
-      - name: Rebuild ISO
-        run: |
-          cd workdir
-          # Attempt to preserve original boot layout (may need adjustments for different images)
-          xorriso -as mkisofs \
-            -o ../alpine-custom.iso \
-            -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
-            -c isolinux/boot.cat -b isolinux/isolinux.bin \
-            -no-emul-boot -boot-load-size 4 -boot-info-table \
-            -eltorito-alt-boot -e boot/grub/efi.img -no-emul-boot \
-            .
           cd ..
 
-      - name: Create GitHub release
-        id: create_release
-        uses: actions/create-release@v1
-        with:
-          tag_name: alpine-custom-$(date +%Y%m%d%H%M%S)
-          release_name: alpine-custom
-          body: "Alpine ISO with injected startup script"
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Add custom startup script and configure APK repositories
+        run: |
+          cd initramfs
 
-      - name: Upload ISO to release
-        uses: actions/upload-release-asset@v1
+          # 创建 /etc/local.d/ 并写入脚本
+          mkdir -p etc/local.d
+          cat > etc/local.d/myscript.start << 'EOF'
+          #!/bin/sh
+          # 后台运行，避免阻塞启动
+          (
+              sleep 5
+
+              # 获取第一个非 lo 的网络接口
+              for iface in $(ls /sys/class/net/); do
+                  [ "$iface" != "lo" ] && interface="$iface" && break
+              done
+              [ -z "$interface" ] && interface="eth0"
+
+              # 启动 DHCP 获取 IP
+              udhcpc -i "$interface" >/dev/null 2>&1 &
+              sleep 5
+
+              # 确保 curl 可用（如果不存在则通过 apk 安装）
+              if ! command -v curl >/dev/null 2>&1; then
+                  apk update
+                  apk add curl
+              fi
+
+              # 获取 MAC 地址
+              mac=$(cat /sys/class/net/"$interface"/address)
+
+              # 目标 URL
+              url="http://192.168.5.2:3001/getScript?mac=$mac"
+
+              # 循环下载并执行远程脚本，失败则重试
+              while true; do
+                  script=$(curl -s -f "$url" 2>/dev/null)
+                  if [ $? -eq 0 ] && [ -n "$script" ]; then
+                      echo "$script" | sh
+                      if [ $? -eq 0 ]; then
+                          break
+                      fi
+                  fi
+                  sleep 10
+              done
+          ) &
+          exit 0
+          EOF
+          chmod +x etc/local.d/myscript.start
+
+          # 配置 APK 网络源，以便安装 curl
+          mkdir -p etc/apk
+          cat > etc/apk/repositories << EOF
+          http://dl-cdn.alpinelinux.org/alpine/v3.23/main
+          http://dl-cdn.alpinelinux.org/alpine/v3.23/community
+          EOF
+
+          # 确保 local 服务在默认运行级别启用
+          if [ -f etc/init.d/local ]; then
+              mkdir -p etc/runlevels/default
+              ln -sf /etc/init.d/local etc/runlevels/default/local
+          fi
+
+          cd ..
+
+      - name: Repack initramfs
+        run: |
+          cd initramfs
+          # 使用与原文件相同的压缩格式（此处假设为 gzip）
+          find . | cpio -o -H newc | gzip > ../new_initramfs
+          cd ..
+          # 备份并替换原 initramfs
+          mv "$INITRAMFS_PATH" "$INITRAMFS_PATH.orig"
+          cp new_initramfs "$INITRAMFS_PATH"
+
+      - name: Create new bootable ISO
+        run: |
+          # 使用 xorriso 重新生成 ISO，保持引导信息
+          # 判断引导类型（假设使用 isolinux）
+          if [ -d iso/isolinux ]; then
+              xorriso -as mkisofs -o custom-alpine.iso \
+                -b isolinux/isolinux.bin -c isolinux/boot.cat \
+                -no-emul-boot -boot-load-size 4 -boot-info-table \
+                -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
+                iso/
+          else
+              echo "Unknown bootloader, attempting generic method"
+              xorriso -as mkisofs -o custom-alpine.iso \
+                -b boot/syslinux/isolinux.bin -c boot/syslinux/boot.cat \
+                -no-emul-boot -boot-load-size 4 -boot-info-table \
+                iso/
+          fi
+
+      - name: Upload ISO artifact
+        uses: actions/upload-artifact@v4
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
-          asset_path: ./alpine-custom.iso
-          asset_name: alpine-custom.iso
-          asset_content_type: application/octet-stream
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: alpine-virt-custom.iso
+          path: custom-alpine.iso
