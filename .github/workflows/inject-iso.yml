@@ -31,10 +31,16 @@ jobs:
       - name: Locate initramfs
         run: |
           INITRAMFS_PATH=$(find iso -name "initramfs-*" | head -1)
+          if [ -z "$INITRAMFS_PATH" ]; then
+            echo "Error: initramfs file not found in iso/"
+            exit 1
+          fi
           echo "INITRAMFS_PATH=$INITRAMFS_PATH" >> $GITHUB_ENV
 
       - name: Extract initramfs
         run: |
+          # 转换为绝对路径，避免后续 cd 导致相对路径失效
+          INITRAMFS_PATH=$(realpath "$INITRAMFS_PATH")
           mkdir initramfs
           cd initramfs
           if file "$INITRAMFS_PATH" | grep -q gzip; then
@@ -117,7 +123,7 @@ jobs:
           # 使用与原文件相同的压缩格式（此处假设为 gzip）
           find . | cpio -o -H newc | gzip > ../new_initramfs
           cd ..
-          # 备份并替换原 initramfs
+          # 备份并替换原 initramfs（使用绝对路径）
           mv "$INITRAMFS_PATH" "$INITRAMFS_PATH.orig"
           cp new_initramfs "$INITRAMFS_PATH"
 
